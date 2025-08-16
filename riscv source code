@@ -1,0 +1,392 @@
+module top_riscv(
+input clk,r,
+input [31:0] pmdr,dmdr, // data in from Program memory (PM) and Data memory (DM)
+output wire dmr, // read enable 
+output wire [1:0] dmw, // write enable considering bus width of 8,16,32 
+output wire [31:0] dmdw,  //data for write to data memory
+output wire [15:0] pmar,dmar,dmaw // address for pm read, dm read and dm write
+);
+reg [3:0] alu_code;
+reg [31:0] alu_ip1,alu_ip2,alu_ip1_e,alu_ip2_e;
+wire [31:0] alu_res;
+wire [1:0] alu_flag;
+
+reg [31:0] inst,inst_e;
+reg [31:0] x0,x1,x2,x3,x31;
+//reg [31:0] x[31:0];
+wire [4:0] rs1,rs2,rd;
+reg [5:0] rd_e,rd_r;
+wire [5:0] rs11,rs21;
+wire [6:0] opcode;
+reg [6:0] opcode_e;
+wire r_type, i_type,s_type,j_type,u_type;
+wire [11:0] imm;
+wire [2:0] funct3;
+reg [2:0] funct3_e, funct3_r;
+reg [31:0] pc,npc,pc_e;
+wire [31:0] load_data,load_store_addr,imm_br,imm_jp; 
+reg [31:0] load_res,res,store_data;
+reg br_cond,rs,dhz;
+
+/*reg[31:0] mem[65535:0] ; 
+initial begin
+mem[0]=32'h00308fe7; //32'hfedcb117; //32'h00208263; //32'h002081a3; //32'h0020a1a3; //32'h00110083; //32'h0020a103; //32'h00208fb3;
+mem[1]=32'h402f8133;
+mem[2]=32'h00610093;
+mem[3]=32'h0020df93;
+mem[4]=32'h0011a133;
+mem[5]=32'h0030a133;
+end
+
+always @ (posedge clk)
+if (s_type==1) mem[load_store_addr]<=store_data;
+ 
+always @ (*)
+load_data= mem[load_store_addr];
+*/
+assign pmar=npc[15:0];
+assign dmar=load_store_addr[15:0];
+assign dmaw=load_store_addr[15:0];
+assign dmr=(opcode_e==7'h03) ?1 : 0;
+assign dmw=(opcode_e!=7'h23)?0: // not a store instruction
+           (funct3_e==3'h0) ?1: // for 8 bit
+           (funct3_e==3'h1) ?2: // for 16 bit
+                             3; // for 32 bit
+            
+assign dmdw=store_data;
+assign load_data=dmdr;
+
+
+
+riscv_alu uut1(
+.alu_code(alu_code),
+.a(alu_ip1_e),
+.b(alu_ip2_e),
+.res(alu_res),
+.flag(alu_flag)
+);
+
+assign funct3=inst[14:12];
+assign rs1=inst[19:15];
+assign rs2= inst[24:20];
+assign rd= inst[11:7];
+assign imm=(i_type==1)?inst[31:20] : {inst[31:25],inst[11:7]};
+assign opcode= inst[6:0];
+assign r_type=(opcode==7'h33)? 1: 0;
+assign i_type=((opcode==7'h13) || (opcode==7'h03) || (opcode==7'h67))? 1: 0;
+assign s_type=(opcode==7'h23) ? 1: 0;
+assign b_type=(opcode==7'h63) ? 1: 0;
+assign j_type=(opcode==7'h6f) ? 1: 0;
+assign u_type=((opcode==7'h37) || (opcode==7'h17))? 1: 0;
+
+//assign load_store_addr=alu_ip1+{{20{imm[11]}},imm};
+assign load_store_addr=alu_res;
+
+assign imm_br= ((funct3==6) || (funct3==7)) ? {19'h0,imm[11],imm[0],imm[10:1],1'b0} : {{19{imm[11]}},imm[11],imm[0],imm[10:1],1'b0};
+assign imm_jp= {{11{inst[31]}},inst[31],inst[19:12],inst[20],inst[30:21],1'b0};
+
+always @ (posedge clk or negedge r)
+if (r==0) rd_e<=6'h3f; else// alu_code
+if (dhz==1) rd_e<=6'h3f; else
+if (rd==0) rd_e<=6'h3f; else
+if ((r_type==1) || (i_type==1) || (j_type==1) || (u_type==1)) rd_e<={1'h0,rd}; else rd_e<={1'h1,rd};
+
+always @ (posedge clk or negedge r)
+if (r==0) opcode_e<=0; else// alu_code
+opcode_e<=opcode;
+
+
+always @ (posedge clk or negedge r)
+if (r==0) rd_r<=6'h3f; else// alu_code
+if (opcode_e==7'h03) rd_r<=rd_e; else rd_r<=6'h3f;
+
+always @ (posedge clk or negedge r)
+if (r==0) alu_code<=0; else// alu_code
+if (opcode==7'h03) alu_code<=0; else // rs1+imm for read address
+begin
+ alu_code[2:0] <= funct3;
+ alu_code[3]<= inst[30]; // funct7=0x20 for sub; imm[10] shra
+ // alu_code={inst[30],inst[14:12]};
+end
+
+always @ (posedge clk or negedge r)
+if (r==0) alu_ip1_e<=0; else// rs1 block
+alu_ip1_e<=alu_ip1;
+
+always @ (*)
+case (rs1)
+ 0 : alu_ip1=x0;
+ 1 : alu_ip1=x1;
+ 2 : alu_ip1=x2;
+ 
+ default : alu_ip1=x31;
+endcase
+//alu_ip1=x[rs1];
+
+always @ (posedge clk or negedge r)
+if (r==0) alu_ip2_e<=0; else// rs2 block
+alu_ip2_e<=alu_ip2;
+
+always @ (*)
+if ((r_type==1) || (b_type==1)) // for R,S,B type instructions
+case (rs2)
+ 0 : alu_ip2=x0;
+ 1 : alu_ip2=x1;
+ 2 : alu_ip2=x2;
+ 
+ default : alu_ip2=x31;
+endcase
+//alu_ip2=x[rs2];
+else // for I type instructions
+begin
+if ((funct3==1) || (funct3==5)) alu_ip2 = {27'h0,imm[4:0]}; else // shift instructions - no sign extension
+                                alu_ip2= {{20{imm[11]}},imm[11:0]}; 
+end
+/*
+always @ (posedge clk or negedge r)
+if (r==0) begin x0<=0;x1<=1;x2<=2;x3<=3;x31<=31; end else
+if (opcode_e!=7'h03)
+begin
+ if (rd_e==1) x1<=res[31:0];
+ if (rd_e==2) x2<=res[31:0];
+ if (rd_e==31) x31<=res[31:0];
+end else 
+begin 
+ if (rd_r==1) x1<=load_res[31:0];
+ if (rd_r==2) x2<=load_res[31:0];
+ if (rd_r==31) x31<=load_res[31:0];
+end
+*/
+always @ (posedge clk or negedge r)
+if (r==0) begin x0<=0;x1<=1;x2<=2;x3<=3;x31<=31; end else
+//if (opcode_e!=7'h03)
+begin
+ if ((opcode_e!=7'h03) && (rd_e==1)) x1<=res[31:0];
+ if ((opcode_e!=7'h03) && (rd_e==2)) x2<=res[31:0];
+ if ((opcode_e!=7'h03) && (rd_e==31)) x31<=res[31:0];
+
+ if (rd_r==1) x1<=load_res[31:0];
+ if (rd_r==2) x2<=load_res[31:0];
+ if (rd_r==31) x31<=load_res[31:0];
+end
+/*
+always @ (posedge clk or negedge r)
+if (r==0) begin for(i=0;i<32;i=i+1)x[i]<=0; end else
+if (opcode_e!=7'h03)
+begin
+ if (rd_e[5]==0) x[rd_e[4:0]]<=res[31:0];
+end else
+begin
+ if (rd_r[5]==0) x[rd_r[4:0]]<=load_res[31:0];
+end
+always @ (*) begin x0=x[0];x1=x[1];x2=x[2];x3=x[3];x31=x[31]; end
+*/
+always @ (posedge clk or negedge r)
+if (r==0) pc<=0; else 
+//if ((opcode!=7'h67) && (dhz==0)) pc<=npc+4;
+//if (dhz==0) pc<=npc-4; else
+if (opcode!=7'h67) pc<=npc+4;
+
+always @ (*)
+begin 
+ if ((b_type==1) && (br_cond==1)) npc=pc+imm_br; else 
+ if (j_type==1)                   npc=pc+imm_jp; else 
+ if (opcode_e==7'h67)             npc=alu_res; else 
+ if (dhz==1)                      npc=pc-4; else
+                                  npc=pc;
+end
+
+assign rs11=((r_type==1) || (s_type==1) || (i_type==1) ||(b_type==1)) ? {1'b0,rs1} : 6'h20;
+assign rs21=((r_type==1) || (s_type==1) || (b_type==1)) ? {1'b0,rs2} : 6'h20;
+
+always @ (*)
+if (rd_e==0) dhz=0; else // nop nnstruction
+if ((rd_e==rs11) || (rd_e==rs21) || (rd_r==rs11) || (rd_r==rs21)) dhz=1; else dhz=0; // detection of datat hazard
+
+always @ (*)
+if ((rd_r==rs11) || (rd_r==rs21)) dhz=1; else  // detection of datat hazard
+if (rd_e==0) dhz=0; else // nop nnstruction
+if ((rd_e==rs11) || (rd_e==rs21)) dhz=1; else dhz=0; // detection of datat hazard
+
+always @ (posedge clk or negedge r)
+if (r==0) pc_e<=0; else pc_e<=pc;
+
+
+always @ (posedge clk or negedge r)
+if (r==0) rs<=0; else rs<=1;
+
+always @ (posedge clk or negedge r)
+if (r==0)                        inst<=32'h00000013; else
+if (rs==0)                       inst<=32'h00000013; else
+if ((b_type==1) && (br_cond==1)) inst<=32'h00000013; else
+if (j_type==1)                   inst<=32'h00000013; else  
+if (opcode==7'h67)               inst<=32'h00000013; else 
+if (opcode_e==7'h67)             inst<=32'h00000013; else 
+if (dhz==0)                      inst<=pmdr;
+
+always @ (posedge clk or negedge r)
+if (r==0) inst_e<=32'h00000013; else inst_e<=inst;
+
+
+always @ (posedge clk or negedge r)
+if (r==0) begin funct3_e<=0; funct3_r<=0; end else
+begin funct3_e<=funct3; funct3_r<=funct3_e; end
+
+always @ (*) // load instruction
+case (funct3_r) // read stage of pipeline
+ 0 : load_res={{24{load_data[7]}},load_data[7:0]};
+ 1 : load_res={{16{load_data[15]}},load_data[15:0]};
+ 4 : load_res={24'h0,load_data[7:0]};
+ 5 : load_res={16'h0,load_data[15:0]};
+ default : load_res=load_data;
+endcase
+
+always @ (*) // store instruction : S type
+case (funct3_e)
+ 0 : store_data={24'h0,alu_ip2_e[7:0]};
+ 1 : store_data={16'h0,alu_ip2_e[15:0]};
+ default : store_data=alu_ip2_e;
+endcase
+ 
+always @ (*) // DECODE STAGE IN PIPELINE FOR BRANCH
+case (funct3)
+ 0 : if (alu_ip1 == alu_ip2)       br_cond=1; else br_cond=0;
+ 1 : if (alu_ip1 != alu_ip2)       br_cond=1; else br_cond=0;
+ 4 : if (alu_ip1 < alu_ip2)        br_cond=1; else br_cond=0;
+ 5 : if (alu_ip1 >= alu_ip2)       br_cond=1; else br_cond=0;
+ 6 : if (alu_ip1 < alu_ip2)        br_cond=1; else br_cond=0;
+ default : if (alu_ip1 >= alu_ip2) br_cond=1; else br_cond=0;
+endcase
+
+always @ (*)
+if ((opcode_e==7'h33) || (opcode_e==7'h13)) res=alu_res; else
+if ((opcode_e==7'h6f) || (opcode_e==7'h67)) res=pc_e; else
+if (opcode_e==7'h37)                        res={inst_e[31:12],12'h0}; else
+if (opcode_e==7'h17)                        res=pc_e+{inst_e[31:12],12'h0}; else
+                                            res=0;
+
+endmodule
+
+module riscv_alu(
+input [3:0] alu_code, 
+input signed [31:0] a,b,
+output wire [31:0] res,
+output [1:0] flag
+    );
+
+wire [31:0] shll,shrl,shra;   
+wire [32:0] a1,b1;  
+reg [32:0] res1;
+
+assign a1={1'b0,a};
+assign b1={1'b0,b};
+assign res= res1[31:0];
+  
+always @ (*)
+case (alu_code)
+ 0 : res1=a1+b1; // add - 0000
+ 1 : res1={1'h0,shll}; //shifter output (shll)
+ 2 : if (a<b)   res1=1; else res1=0; // a,b= signed  stl
+ 3 : if (a1<b1) res1=1; else res1=0; // a1,b1= unsigned stl(u)
+ 4 : res1=a1^b1;
+ 5 : res1={1'h0,shrl}; // shift right logical (shrl)
+ 6 : res1=a1|b1;
+ 7 : res1=a1&b1;
+ 8 : res1=a1-b1; // sub - 1000
+ default : res1={1'h0,shra}; // shift right arithematic (code = D) (shra)
+endcase
+
+assign shll=(b==0)?a:
+            (b==1)?{a[30:0],1'h0}:
+            (b==2)?{a[29:0],2'h0}:
+            (b==3)?{a[28:0],3'h0}:
+         
+            (b==31)?{a[0],31'h0}: 0;
+            
+assign shrl=(b==0)?a:
+            (b==1)?{1'h0,a[31:1]}:
+            (b==2)?{2'h0,a[31:2]}:
+            (b==3)?{3'h0,a[31:3]}:
+            
+            (b==31)?{31'h0,a[31]}: 0;
+            
+assign shra=(b==0)?a:
+            (b==1)?{a[31],a[31:1]}:
+            (b==2)?{{2{a[31]}},a[31:2]}:
+            (b==3)?{{3{a[31]}},a[31:3]}:
+            
+            (b==31)?{{31{a[31]}},a[31]}: 0;
+            
+           
+endmodule 
+
+module self_check(
+input clk,r,
+input [31:0] pmdr,dmdr, // data in from Program memory (PM) and Data memory (DM)
+output wire dmrs, // read enable 
+output wire [1:0] dmws, // write enable considering bus width of 8,16,32 
+output wire [31:0] dmdws,  //data for write to data memory
+output wire [15:0] pmars,dmars,dmaws // address for pm read, dm read and dm write
+);
+
+wire dmr1, dmr2; // read enable 
+wire [1:0] dmw1,dmw2; // write enable considering bus width of 8,16,32 
+wire [31:0] dmdw1,dmdw2;  //data for write to data memory
+wire [15:0] pmar1,pmar2,dmar1,dmar2,dmaw1,dmaw2; // address for pm read, dm read and dm write
+wire okay;
+// address for pm read, dm read and dm write
+ assign dmrs=dmr1;
+ assign dmws=dmw1;
+ assign pmars=pmar1;
+ assign dmars=dmar1;
+ assign dmaws=dmaw1;
+ assign dmdws=dmdw1;
+ 
+ reg [31:0] pmdr2,err;
+ 
+ always @ (*)
+ pmdr2= pmdr^err;
+ 
+ initial begin
+ err=0;
+ #100; err=32'hffffffff;
+ #100; err=0;
+ end
+ 
+ 
+ assign okay=((dmr2==dmr1) && (dmw2==dmw1) && (pmar2==pmar1) && (dmar2==dmar1) && (dmaw2==dmaw1) && (dmdw2==dmdw1)) ? 1 : 0;
+
+top_riscv uut1 (
+        .clk(clk),
+        .r(r),
+        .pmdr(pmdr),
+        .dmdr(dmdr), // data in from Program memory (PM) and Data memory (DM)
+        .dmr(dmr1), // read enable 
+        .dmw(dmw1), // write enable considering bus width of 8,16,32 
+        .dmdw(dmdw1),  //data for write to data memory
+        .pmar(pmar1),
+        .dmar(dmar1),
+        .dmaw(dmaw1) // address for pm read, dm read and dm write
+
+        );
+        
+        
+top_riscv uut2 (
+        .clk(clk),
+        .r(r),
+        .pmdr(pmdr2),
+        .dmdr(dmdr), // data in from Program memory (PM) and Data memory (DM)
+        .dmr(dmr2), // read enable 
+        .dmw(dmw2), // write enable considering bus width of 8,16,32 
+        .dmdw(dmdw2),  //data for write to data memory
+        .pmar(pmar2),
+        .dmar(dmar2),
+        .dmaw(dmaw2) // address for pm read, dm read and dm write
+
+        );
+
+
+
+
+          
+endmodule
